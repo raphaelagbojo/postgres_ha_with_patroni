@@ -1,0 +1,1 @@
+# postgres_ha_with_patroni
