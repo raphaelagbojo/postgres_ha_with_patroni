@@ -1,0 +1,912 @@
+# the following servers below were provisioned in a virtual box 
+# Linux distribution used is RHEL (Rocky Linux) v9.6 Blue Onyx
+
+# Note, there will be 3 nodes in the patroni cluster, 1 primary 2 read replicas & 3 HAProxy servers for load balancing & VIP
+
+# server_name : host/IP
+#postgres
+psql11 : 192.168.64.11 
+psql12 : 192.168.64.12
+psql13 : 192.168.64.13
+
+#haproxy
+hap11 : 192.168.64.14
+hap12 : 192.168.64.16
+hap13 : 192.168.64.17
+
+# install postgres repo & other additional modules -> this should be done on all 3 postgres nodes
+sudo dnf update -y 
+sudo dnf install postgresql-server postgresql-contrib -y
+
+# confirm postgres has been installed
+psql --version
+
+# upon confirmation of the installation of postgres, the service will be stopped because patroni will be managing the postgres database instances 
+# stop services -> this should be done on all 3 postgres nodes
+sudo systemctl stop postgresql
+sudo systemctl disable postgresql
+
+# install etcd -> this should be done on all 3 postgres nodes
+wget https://github.com/etcd-io/etcd/releases/download/v3.6.1/etcd-v3.6.1-linux-arm64.tar.gz # this is assuming either of wget/curl is installed on the server
+
+# confirm your linux distribution before downloading the etcd file above 
+uname -a
+
+# untar the file, rename & move the files extracted to the local bin folder -> this should be done on all 3 postgres nodes
+tar -xvf etcd-v3.6.1-linux-arm64.tar.gz
+mv etcd-v3.6.1-linux-arm64 etcd
+sudo mv etcd/etcd* /usr/local/bin/
+
+# confirm etcd & its packages have been installed
+etcd --version 
+etcdutl version
+etcdctl version
+
+# create a user designated for etcd, this user will be created as a system account & prevents access to use by other users -> this should be done on all 3 postgres nodes
+sudo useradd --system --home /var/lib/etcd --shell /bin/false etcd
+
+# make directories to be used for all etcd configs -> this should be done on all 3 postgres nodes
+sudo mkdir -p /etc/etcd
+sudo mkdir -p /etc/etcd/ssl
+
+# the following steps below will be carried out outside the postgres nodes
+# certificates for the nodes will be generated to enable secure communications within the servers for etcd & postgres
+brew install openssl
+
+# confirm installation 
+openssl --version
+
+# create dedicated folders for this certs & navigate into it
+mkdir generate_certs
+cd generate_certs
+
+# generate key for reach nodes, set to expire in 10 years
+openssl genrsa -out ca.key 2048
+openssl req -x509 -new -nodes -key ca.key -subj "/CN=etcd-ca" -days 3650 -out ca.crt
+
+# for node1
+# Generate the private key, csr & sign the certs
+openssl genrsa -out etcd-node1.key 2048
+
+cat > temp1.cnf <<EOF
+[ req ]
+distinguished_name = req_distinguished_name
+req_extensions = v3_req
+[ req_distinguished_name ]
+[ v3_req ]
+subjectAltName = @alt_names
+[ alt_names ]
+IP.1 = 192.168.64.11
+IP.2 = 127.0.0.1
+EOF
+
+openssl req -new -key etcd-node1.key -out etcd-node1.csr -subj "/C=US/ST=YourState/L=YourCity/O=YourOrganization/OU=YourUnit/CN=etcd-node1" -config temp1.cnf
+
+openssl x509 -req -in etcd-node1.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out etcd-node1.crt -days 3650 -sha256 -extensions v3_req -extfile temp1.cnf
+
+# for node2
+# Generate the private key, csr & sign the certs
+openssl genrsa -out etcd-node2.key 2048
+
+cat > temp2.cnf <<EOF
+[ req ]
+distinguished_name = req_distinguished_name
+req_extensions = v3_req
+[ req_distinguished_name ]
+[ v3_req ]
+subjectAltName = @alt_names
+[ alt_names ]
+IP.1 = 192.168.64.12
+IP.2 = 127.0.0.1
+EOF
+
+openssl req -new -key etcd-node2.key -out etcd-node2.csr -subj "/C=US/ST=YourState/L=YourCity/O=YourOrganization/OU=YourUnit/CN=etcd-node2" -config temp2.cnf
+
+openssl x509 -req -in etcd-node2.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out etcd-node2.crt -days 3650 -sha256 -extensions v3_req -extfile temp2.cnf
+
+# for node3
+# Generate the private key, csr & sign the certs
+openssl genrsa -out etcd-node3.key 2048
+
+cat > temp3.cnf <<EOF
+[ req ]
+distinguished_name = req_distinguished_name
+req_extensions = v3_req
+[ req_distinguished_name ]
+[ v3_req ]
+subjectAltName = @alt_names
+[ alt_names ]
+IP.1 = 192.168.64.13
+IP.2 = 127.0.0.1
+EOF
+
+openssl req -new -key etcd-node3.key -out etcd-node3.csr -subj "/C=US/ST=YourState/L=YourCity/O=YourOrganization/OU=YourUnit/CN=etcd-node3" -config temp3.cnf
+
+openssl x509 -req -in etcd-node3.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out etcd-node3.crt -days 3650 -sha256 -extensions v3_req -extfile temp3.cnf
+
+# Remove temp files as they are no longer needed (optional)
+
+rm temp1.cnf
+rm temp2.cnf
+rm temp3.cnf
+
+# move the certificates generated for each node into their respective servers, ensure ssh is setup on the respective nodes
+scp ca.crt etcd-node1.crt etcd-node1.key ra@192.168.64.11:/tmp/
+scp ca.crt etcd-node2.crt etcd-node2.key ra@192.168.64.12:/tmp/
+scp ca.crt etcd-node3.crt etcd-node3.key ra@192.168.64.13:/tmp/
+
+# back to the nodes
+# move the certs. into the ssl folder created in line #50, make the etcd user created earlier the owner & fine tune the permissions -> this should be done on all 3 postgres nodes
+sudo mv /tmp/etcd-node*.crt /etc/etcd/ssl/
+sudo mv /tmp/etcd-node*.key /etc/etcd/ssl/
+sudo mv /tmp/ca.crt /etc/etcd/ssl/
+sudo chown -R etcd:etcd /etc/etcd/
+sudo chmod 600 /etc/etcd/ssl/etcd-node*.key
+sudo chmod 644 /etc/etcd/ssl/etcd-node*.crt /etc/etcd/ssl/ca.crt
+
+# create the etcd config files
+# for node 1: 
+sudo vi /etc/etcd/etcd.env
+
+# paste the below and save
+ETCD_NAME="psql11"
+ETCD_DATA_DIR="/var/lib/etcd"
+ETCD_INITIAL_CLUSTER="psql11=https://192.168.64.11:2380,psql12=https://192.168.64.12:2380,psql13=https://192.168.64.13:2380"
+ETCD_INITIAL_CLUSTER_STATE="new"
+ETCD_INITIAL_CLUSTER_TOKEN="etcd-cluster"
+ETCD_INITIAL_ADVERTISE_PEER_URLS="https://192.168.64.11:2380"
+ETCD_LISTEN_PEER_URLS="https://0.0.0.0:2380"
+ETCD_LISTEN_CLIENT_URLS="https://0.0.0.0:2379"
+ETCD_ADVERTISE_CLIENT_URLS="https://192.168.64.11:2379"
+ETCD_CLIENT_CERT_AUTH="true"
+ETCD_TRUSTED_CA_FILE="/etc/etcd/ssl/ca.crt"
+ETCD_CERT_FILE="/etc/etcd/ssl/etcd-node1.crt"
+ETCD_KEY_FILE="/etc/etcd/ssl/etcd-node1.key"
+ETCD_PEER_CLIENT_CERT_AUTH="true"
+ETCD_PEER_TRUSTED_CA_FILE="/etc/etcd/ssl/ca.crt"
+ETCD_PEER_CERT_FILE="/etc/etcd/ssl/etcd-node1.crt"
+ETCD_PEER_KEY_FILE="/etc/etcd/ssl/etcd-node1.key"
+
+# for node 2:
+sudo vi /etc/etcd/etcd.env
+
+# paste the below and save
+ETCD_NAME="psql12"
+ETCD_DATA_DIR="/var/lib/etcd"
+ETCD_INITIAL_CLUSTER="psql11=https://192.168.64.11:2380,psql12=https://192.168.64.12:2380,psql13=https://192.168.64.13:2380"
+ETCD_INITIAL_CLUSTER_STATE="new"
+ETCD_INITIAL_CLUSTER_TOKEN="etcd-cluster"
+ETCD_INITIAL_ADVERTISE_PEER_URLS="https://192.168.64.12:2380"
+ETCD_LISTEN_PEER_URLS="https://0.0.0.0:2380"
+ETCD_LISTEN_CLIENT_URLS="https://0.0.0.0:2379"
+ETCD_ADVERTISE_CLIENT_URLS="https://192.168.64.12:2379"
+ETCD_CLIENT_CERT_AUTH="true"
+ETCD_TRUSTED_CA_FILE="/etc/etcd/ssl/ca.crt"
+ETCD_CERT_FILE="/etc/etcd/ssl/etcd-node2.crt"
+ETCD_KEY_FILE="/etc/etcd/ssl/etcd-node2.key"
+ETCD_PEER_CLIENT_CERT_AUTH="true"
+ETCD_PEER_TRUSTED_CA_FILE="/etc/etcd/ssl/ca.crt"
+ETCD_PEER_CERT_FILE="/etc/etcd/ssl/etcd-node2.crt"
+ETCD_PEER_KEY_FILE="/etc/etcd/ssl/etcd-node2.key"
+
+# for node 3:
+sudo vi /etc/etcd/etcd.env
+
+# paste the below and save
+ETCD_NAME="psql13"
+ETCD_DATA_DIR="/var/lib/etcd"
+ETCD_INITIAL_CLUSTER="psql11=https://192.168.64.11:2380,psql12=https://192.168.64.12:2380,psql13=https://192.168.64.13:2380"
+ETCD_INITIAL_CLUSTER_STATE="new"
+ETCD_INITIAL_CLUSTER_TOKEN="etcd-cluster"
+ETCD_INITIAL_ADVERTISE_PEER_URLS="https://192.168.64.13:2380"
+ETCD_LISTEN_PEER_URLS="https://0.0.0.0:2380"
+ETCD_LISTEN_CLIENT_URLS="https://0.0.0.0:2379"
+ETCD_ADVERTISE_CLIENT_URLS="https://192.168.64.13:2379"
+ETCD_CLIENT_CERT_AUTH="true"
+ETCD_TRUSTED_CA_FILE="/etc/etcd/ssl/ca.crt"
+ETCD_CERT_FILE="/etc/etcd/ssl/etcd-node3.crt"
+ETCD_KEY_FILE="/etc/etcd/ssl/etcd-node3.key"
+ETCD_PEER_CLIENT_CERT_AUTH="true"
+ETCD_PEER_TRUSTED_CA_FILE="/etc/etcd/ssl/ca.crt"
+ETCD_PEER_CERT_FILE="/etc/etcd/ssl/etcd-node3.crt"
+ETCD_PEER_KEY_FILE="/etc/etcd/ssl/etcd-node3.key"
+
+# creating the etcd service -> this should be done on all 3 postgres nodes
+sudo vi /etc/systemd/system/etcd.service
+
+# paste the below and save
+[Unit]
+Description=etcd key-value store
+Documentation=https://github.com/etcd-io/etcd
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+WorkingDirectory=/var/lib/etcd
+EnvironmentFile=/etc/etcd/etcd.env
+ExecStart=/usr/local/bin/etcd
+Restart=always
+RestartSec=10s
+LimitNOFILE=40000
+User=etcd
+Group=etcd
+
+[Install]
+WantedBy=multi-user.target
+
+# create the etcd data dir specified in the configs & service file and adjust the ownership -> this should be done on all 3 postgres nodes
+sudo mkdir -p /var/lib/etcd 
+sudo chown -R etcd:etcd /var/lib/etcd
+
+# note, before going ahead, depending on your distribution, there is need to allow certain ports as specified in the config files
+# using rockylinux, add the ports above to the list of allowed ports on the firewall 
+# list allowed ports
+sudo firewall-cmd --list-all
+
+# add the ports needed and reload the firewal config  -> this should be done on all 3 postgres nodes
+sudo firewall-cmd --permanent --add-port=2379/tcp
+sudo firewall-cmd --permanent --add-port=2380/tcp
+sudo firewall-cmd --reload
+
+# more ports will be added as the setup continues
+
+# reload the daemon, enable & start etcd -> this should be done on all 3 postgres nodes
+sudo systemctl daemon-reload
+sudo systemctl enable etcd
+sudo systemctl start etcd
+
+# check etcd's status, it should up now
+sudo systemctl status etcd
+
+# if it isn't up, troubleshoot with the steps below 
+# check the logs, look out for any anomaly
+journalctl -u etcd -n 100
+
+# if it is a permission issue, check the steps prior to starting the service above if anything was omitted or try the below 
+# check for the security context of files & directory
+ls -Z /usr/local/bin/etcd
+
+# reset it 
+restorecon -v /usr/local/bin/etcd
+
+# another troubleshooting step is to check the security policy, temporarily relax it and revert after starting the etcd service
+getenforce
+sudo setenforce 0
+sudo setenforce 1 # run this after confirming etcd is up
+
+# other errors to look out for is mispellings in config files 
+
+# next steps assuming etcd is now running, view logs & follow 
+journalctl -u etcd -f 
+
+# other validity checks for etcd
+# telneting each node & port
+telnet 192.168.64.11 2379
+telnet 192.168.64.11 2380
+telnet 192.168.64.12 2379
+telnet 192.168.64.12 2380
+telnet 192.168.64.13 2379
+telnet 192.168.64.13 2380
+
+# run for each node to confirm endpoint health
+sudo etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/etc/etcd/ssl/ca.crt --cert=/etc/etcd/ssl/etcd-node1.crt --key=/etc/etcd/ssl/etcd-node1.key endpoint health
+sudo etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/etc/etcd/ssl/ca.crt --cert=/etc/etcd/ssl/etcd-node2.crt --key=/etc/etcd/ssl/etcd-node2.key endpoint health
+sudo etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/etc/etcd/ssl/ca.crt --cert=/etc/etcd/ssl/etcd-node3.crt --key=/etc/etcd/ssl/etcd-node3.key endpoint health
+
+# list etcd instances based on leaders & followers
+sudo etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/etc/etcd/ssl/ca.crt --cert=/etc/etcd/ssl/etcd-node1.crt --key=/etc/etcd/ssl/etcd-node1.key member list
+sudo etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/etc/etcd/ssl/ca.crt --cert=/etc/etcd/ssl/etcd-node2.crt --key=/etc/etcd/ssl/etcd-node2.key member list
+sudo etcdctl --endpoints=https://127.0.0.1:2379 --cacert=/etc/etcd/ssl/ca.crt --cert=/etc/etcd/ssl/etcd-node3.crt --key=/etc/etcd/ssl/etcd-node3.key member list
+
+# list instances based on leaders & followers and other details in a tabular format
+sudo etcdctl --endpoints=https://192.168.64.11:2379,https://192.168.64.12:2379,https://192.168.64.13:2379 --cacert=/etc/etcd/ssl/ca.crt --cert=/etc/etcd/ssl/etcd-node1.crt --key=/etc/etcd/ssl/etcd-node1.key endpoint status --write-out=table
+sudo etcdctl --endpoints=https://192.168.64.11:2379,https://192.168.64.12:2379,https://192.168.64.13:2379 --cacert=/etc/etcd/ssl/ca.crt --cert=/etc/etcd/ssl/etcd-node2.crt --key=/etc/etcd/ssl/etcd-node2.key endpoint status --write-out=table
+sudo etcdctl --endpoints=https://192.168.64.11:2379,https://192.168.64.12:2379,https://192.168.64.13:2379 --cacert=/etc/etcd/ssl/ca.crt --cert=/etc/etcd/ssl/etcd-node3.crt --key=/etc/etcd/ssl/etcd-node3.key endpoint status --write-out=table
+
+# upon confirmation etcd is up & running, set up for patroni & postgres are the next steps
+
+# create data dir for pg & ssl, certs will be generated for the ssl path in the next steps -> this should be done on all 3 postgres nodes
+sudo mkdir -p /var/lib/postgresql/data
+sudo mkdir -p /var/lib/postgresql/ssl
+
+# the steps below will be carried out outside the postgres nodes
+# certificates will be generated that last 10 years, preferably navigate into the path created above in line 60 to create them
+openssl genrsa -out server.key 2048 
+openssl req -new -key server.key -out server.req 
+openssl req -x509 -key server.key -in server.req -out server.crt -days 3650 
+
+# move to the respective nodes
+scp server.crt server.key server.req ra@192.168.64.11:/tmp
+scp server.crt server.key server.req ra@192.168.64.12:/tmp
+scp server.crt server.key server.req ra@192.168.64.13:/tmp
+
+# move the files to the ssl path created above & adjust the permissions where necessary -> this should be done on all 3 postgres nodes
+cd /tmp
+sudo mv server.crt server.key server.req /var/lib/postgresql/ssl
+sudo chmod 600 /var/lib/postgresql/ssl/server.key
+sudo chmod 644 /var/lib/postgresql/ssl/server.crt
+sudo chmod 600 /var/lib/postgresql/ssl/server.req
+
+# make postgres the owner of these directories
+sudo chown postgres:postgres /var/lib/postgresql/data
+sudo chown postgres:postgres /var/lib/postgresql/ssl/server.*
+
+# for the next step, ACL will be used to to manage Access Control for the etcd certs files and directories created earlier
+# install acl -> this should be done on all 3 postgres nodes
+sudo dnf install -y acl
+
+# for node 1
+sudo setfacl -m u:postgres:r /etc/etcd/ssl/ca.crt
+sudo setfacl -m u:postgres:r /etc/etcd/ssl/etcd-node1.crt
+sudo setfacl -m u:postgres:r /etc/etcd/ssl/etcd-node1.key
+
+# for node 2 
+sudo setfacl -m u:postgres:r /etc/etcd/ssl/ca.crt
+sudo setfacl -m u:postgres:r /etc/etcd/ssl/etcd-node2.crt
+sudo setfacl -m u:postgres:r /etc/etcd/ssl/etcd-node2.key
+
+# for node 3
+sudo setfacl -m u:postgres:r /etc/etcd/ssl/ca.crt
+sudo setfacl -m u:postgres:r /etc/etcd/ssl/etcd-node3.crt
+sudo setfacl -m u:postgres:r /etc/etcd/ssl/etcd-node3.key
+
+# configuring patroni 
+
+# install the redhat pkg manager to install patroni -> this should be done on all 3 postgres nodes
+sudo dnf install -y https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-aarch64/pgdg-redhat-repo-latest.noarch.rpm
+
+# ensure the postgres module is disabled, as aforementioned on line #24, it will be managed by patroni
+sudo dnf -qy module disable postgresql
+
+# install patroni
+sudo dnf install -y patroni patroni-etcd
+
+# create the patroni directory -> this should be done on all 3 postgres nodes
+sudo mkdir -p /etc/patroni/
+
+# create a config file for patroni where the cluster will be bootstrapped from
+# for node 1: 
+sudo vi /etc/patroni/patroni.yml
+
+# paste the below and save
+scope: postgresql-cluster
+namespace: /service/
+name: psql11
+
+etcd3:
+  hosts: 192.168.64.11:2379,192.168.64.12:2379,192.168.64.13:2379
+  protocol: https
+  cacert: /etc/etcd/ssl/ca.crt
+  cert: /etc/etcd/ssl/etcd-node1.crt
+  key: /etc/etcd/ssl/etcd-node1.key
+
+restapi:
+  listen: 0.0.0.0:8008
+  connect_address: 192.168.64.11:8008
+  certfile: /var/lib/postgresql/ssl/server.pem
+
+bootstrap:
+  dcs:
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    maximum_lag_on_failover: 1048576
+    postgresql:
+        parameters:
+            ssl: 'on'
+            ssl_cert_file: /var/lib/postgresql/ssl/server.crt
+            ssl_key_file: /var/lib/postgresql/ssl/server.key
+        pg_hba:
+        - hostssl replication replicator 127.0.0.1/32 md5
+        - hostssl replication replicator 192.168.64.11/32 md5
+        - hostssl replication replicator 192.168.64.12/32 md5
+        - hostssl replication replicator 192.168.64.13/32 md5
+        - hostssl all all 127.0.0.1/32 md5
+        - hostssl all all 0.0.0.0/0 md5
+  initdb:
+    - encoding: UTF8
+    - data-checksums
+
+postgresql:
+  listen: 0.0.0.0:5432
+  connect_address: 192.168.64.11:5432
+  data_dir: /var/lib/postgresql/data
+  bin_dir: /usr/bin/
+  authentication:
+    superuser:
+      username: postgres
+      password: "QWERTYqwertyQWER1234#"
+    replication:
+      username: replicator
+      password: "QWERTYqwertyQWER1234#"
+  parameters:
+    max_connections: 500
+    shared_buffers: 256MB
+
+tags:
+  nofailover: false
+  noloadbalance: false
+  clonefrom: false
+
+# for node 2: 
+sudo vi /etc/patroni/patroni.yml
+
+# paste the below and save
+scope: postgresql-cluster
+namespace: /service/
+name: psql12
+
+etcd3:
+  hosts: 192.168.64.11:2379,192.168.64.12:2379,192.168.64.13:2379
+  protocol: https
+  cacert: /etc/etcd/ssl/ca.crt
+  cert: /etc/etcd/ssl/etcd-node2.crt
+  key: /etc/etcd/ssl/etcd-node2.key
+
+restapi:
+  listen: 0.0.0.0:8008
+  connect_address: 192.168.64.12:8008
+  certfile: /var/lib/postgresql/ssl/server.pem
+
+bootstrap:
+  dcs:
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    maximum_lag_on_failover: 1048576
+    postgresql:
+        parameters:
+        ssl: 'on'
+        ssl_cert_file: /var/lib/postgresql/ssl/server.crt
+        ssl_key_file: /var/lib/postgresql/ssl/server.key
+        pg_hba:
+        - hostssl replication replicator 127.0.0.1/32 md5
+        - hostssl replication replicator 192.168.64.11/32 md5
+        - hostssl replication replicator 192.168.64.12/32 md5
+        - hostssl replication replicator 192.168.64.13/32 md5
+        - hostssl all all 127.0.0.1/32 md5
+        - hostssl all all 0.0.0.0/0 md5
+  initdb:
+    - encoding: UTF8
+    - data-checksums
+
+postgresql:
+  listen: 0.0.0.0:5432
+  connect_address: 192.168.64.12:5432
+  data_dir: /var/lib/postgresql/data
+  bin_dir: /usr/bin/
+  authentication:
+    superuser:
+      username: postgres
+      password: "QWERTYqwertyQWER1234#"
+    replication:
+      username: replicator
+      password: "QWERTYqwertyQWER1234#"
+  parameters:
+    max_connections: 500
+    shared_buffers: 256MB
+
+tags:
+  nofailover: false
+  noloadbalance: false
+  clonefrom: false
+
+# for node 3: 
+sudo vi /etc/patroni/patroni.yml
+
+# paste the below and save
+scope: postgresql-cluster
+namespace: /service/
+name: psql13
+
+etcd3:
+  hosts: 192.168.64.11:2379,192.168.64.12:2379,192.168.64.13:2379
+  protocol: https
+  cacert: /etc/etcd/ssl/ca.crt
+  cert: /etc/etcd/ssl/etcd-node3.crt
+  key: /etc/etcd/ssl/etcd-node3.key
+
+restapi:
+  listen: 0.0.0.0:8008
+  connect_address: 192.168.64.13:8008
+  certfile: /var/lib/postgresql/ssl/server.pem
+
+bootstrap:
+  dcs:
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    maximum_lag_on_failover: 1048576
+    postgresql:
+        parameters:
+        ssl: 'on'
+        ssl_cert_file: /var/lib/postgresql/ssl/server.crt
+        ssl_key_file: /var/lib/postgresql/ssl/server.key
+        pg_hba:
+        - hostssl replication replicator 127.0.0.1/32 md5
+        - hostssl replication replicator 192.168.64.11/32 md5
+        - hostssl replication replicator 192.168.64.12/32 md5
+        - hostssl replication replicator 192.168.64.13/32 md5
+        - hostssl all all 127.0.0.1/32 md5
+        - hostssl all all 0.0.0.0/0 md5
+  initdb:
+    - encoding: UTF8
+    - data-checksums
+
+postgresql:
+  listen: 0.0.0.0:5432
+  connect_address: 192.168.64.13:5432
+  data_dir: /var/lib/postgresql/data
+  bin_dir: /usr/bin/
+  authentication:
+    superuser:
+      username: postgres
+      password: "QWERTYqwertyQWER1234#"
+    replication:
+      username: replicator
+      password: "QWERTYqwertyQWER1234#"
+  parameters:
+    max_connections: 100
+    shared_buffers: 256MB
+    #recovery_min_apply_delay: 5min # this will be explained later
+
+tags:
+  nofailover: false
+  noloadbalance: false
+  clonefrom: false
+
+# explaining a few things from the config files above
+# - postgres was initiated with the basic configurations, the connection parameters will be changed later
+# - troubles locating your bin directory? run the below:
+#       find / -name initdb 2>/dev/null # this should display the bin dir, replace it in the bin_dir parameter above
+# - identify the postgres package installed 
+#       rpm -qa | grep postgresql
+# - passwords can be changed but ensure it meets the requirements of a strong password
+# - the recovery_min_apply_delay parameter was added only in the last node, this is to delay replication in the case of a disaster on the primary
+# - it is currently commented, so it won't take effect
+# - important to note that the parameter was added locally, so the change won't replicate to the 2 other nodes
+
+# create the server.pem file in the configs for each servr & adjust the necessary permissions
+sudo sh -c 'cat /var/lib/postgresql/ssl/server.crt /var/lib/postgresql/ssl/server.key > /var/lib/postgresql/ssl/server.pem'
+sudo chown postgres:postgres /var/lib/postgresql/ssl/server.pem
+sudo chmod 600 /var/lib/postgresql/ssl/server.pem
+
+# note, before going ahead, depending on your distribution, there is need to allow certain ports as specified in the config files
+# using rockylinux, add the ports above to the list of allowed ports on the firewall 
+# list allowed ports
+sudo firewall-cmd --list-all
+
+# add the ports needed and reload the firewal config  -> this should be done on all 3 postgres nodes
+sudo firewall-cmd --permanent --add-port=8008/tcp
+sudo firewall-cmd --permanent --add-port=5432/tcp
+sudo firewall-cmd --reload
+
+# restart the patroni service -> this should be done on all 3 postgres nodes
+sudo systemctl restart patroni 
+
+# check the logs for patroni and follow 
+journalctl -u patroni -f
+
+# on the primary node the below should be seen in the logs 
+INFO: no action. I am (psql11), the leader with the lock
+
+# on the secondary node the below should be seen in the logs 
+INFO: no action. I am (psql12), a secondary, and following a leader (psql11)
+
+# on the secondary node the below should be seen in the logs 
+INFO: no action. I am (psql13), a secondary, and following a leader (psql11)
+
+# troubleshooting steps should any node not start patroni
+# validate the config file
+patroni --validate-config /etc/patroni/patroni.yml
+
+# ensure the necessary permissions are given, check the steps above for any omission & for mispellings
+
+# confirm the user and group running the patroni service, it should both be postgres
+systemctl cat patroni | grep User
+systemctl cat patroni | grep Group
+
+# temporarily relax the enforcing and revert after the service start 
+sudo setenforce 0
+sudo setenforce 1 # run this after confirming patroni is up
+
+# reload the daemon & restart patroni & monitor the logs 
+sudo systemctl daemon-reload
+sudo systemctl start patroni
+
+# next step is to change the cluster state in the etcd config file from new to existing, so a new cluster isnt initiated anytime it is restarted
+sudo vi /etc/etcd/etcd.env
+
+# change the value from new to existing -> this should be done on all 3 postgres nodes
+ETCD_INITIAL_CLUSTER_STATE="new" -> ETCD_INITIAL_CLUSTER_STATE="existing"
+
+# confirm from each node in the cluster who is primary 
+curl -k https://192.168.64.11:8008/primary
+curl -k https://192.168.64.12:8008/primary
+curl -k https://192.168.64.13:8008/primary
+
+# look out for 
+#   - state, it should be running 
+#   - role, either primary/replica
+#   - replication_state, should be streaming for read replicas
+
+# note, ensure there are no port mismatch in the config file for patroni as this could lead to miscommunicatons among nodes in the cluster
+
+# with our patroni cluster setup, let's begin management 
+# having identified the primary cluster from the curl command above, check the status of the cluster 
+sudo patronictl -c /etc/patroni/patroni.yml list
+
+# increasing the max connection to 50000, confirm the open file descriptor on the server & make necessary adjustments -> this should be done on all 3 postgres nodes
+su - postgres -c 'ulimit -n'
+
+# set the default & maximum limit in the file below -> this should be done on all 3 postgres nodes
+sudo vi /etc/security/limits.conf
+postgres soft nofile 65536
+postgres hard nofile 65536
+postgres soft nproc 50000
+postgres hard nproc 50000
+
+# system wide conns -> this should be done on all 3 postgres nodes
+sudo vi /proc/sys/fs/file-max
+
+# paste the below -> this should be done on all 3 postgres nodes
+10000
+
+# the next step should be carried out only on the primary node as it will be replicated to the other nodes in the cluster
+sudo patronictl -c /etc/patroni/patroni.yml edit-config
+
+# under parameters, append the content below, ensure proper indentation 
+max_connections: 50000
+
+# save the file & check the status of the cluster
+sudo patronictl -c /etc/patroni/patroni.yml list
+
+# two new columns should appear containing  " Pending restart | Pending restart reason "
+
+# restart the patroni service on each nodes starting from primary to the read replicas to effect the change
+sudo systemctl restart patroni
+
+# check the status of the cluster, the two added columns should be gone
+sudo patronictl -c /etc/patroni/patroni.yml list
+
+# configuring HA proxy, sole purpose is for load balancing & ensuring users connect to the db with port 5566
+
+# install haproxy -> this should be done on all 3 haproxy nodes
+sudo dnf -y install haproxy
+
+# open the existing config file -> this should be done on all 3 haproxy nodes
+sudo vi /etc/haproxy/haproxy.cfg
+
+# paste/append the below to the config file -> this should be done on all 3 haproxy nodes
+frontend postgres_frontend
+    bind *:5566
+    mode tcp
+    default_backend postgres_backend
+
+backend postgres_backend
+    mode tcp
+    option tcp-check
+    option httpchk GET /primary
+    http-check expect status 200
+    timeout connect 5s
+    timeout client 30s
+    timeout server 30s
+    server psql11 192.168.64.11:5432 port 8008 check check-ssl verify none
+    server psql12 192.168.64.12:5432 port 8008 check check-ssl verify none
+    server psql13 192.168.64.13:5432 port 8008 check check-ssl verify none
+
+# explaining a few things from the config files above
+#   - traffic recieved from the frontend would be rerouted to the backend to communicate with the backend server 
+#   - mode of connection is tcp
+#   - haproxy performs health checks on the servers in the backend, it reports which of the servers is up or down (this can be gotten from the logs) 
+#   - health check is carried out over the HTTP protocol and return a 200 status for a successful check 
+#   - timeout connect tells haproxy to retry another backend server if the initial one is unreachable after 5s of trying
+#   - timeout client is for closing up unused connections, this prevents pile up of idle connections.
+#   - timeout server similar work as client
+#   - the health check is reported on port 8008
+#   - ssl is checked to ensure connection is secured but no verification is happening (solely for simulation purposes)
+
+# note, before going ahead, depending on your distribution, there is need to allow certain ports as specified in the config files
+# using rockylinux, add the ports above to the list of allowed ports on the firewall 
+# list allowed ports
+sudo firewall-cmd --list-all
+
+# add the ports needed and reload the firewal config  -> this should be done on all 3 haproxy nodes
+sudo firewall-cmd --permanent --add-port=8008/tcp
+sudo firewall-cmd --permanent --add-port=5432/tcp
+sudo firewall-cmd --permanent --add-port=5566/tcp
+sudo firewall-cmd --reload
+
+# reload the haproxy service 
+sudo systemctl reload haproxy
+
+# troubleshooting haproxy failing to start up 
+
+# check the logs, look out for anomaly
+journalctl -u haproxy -n 100
+
+#install this pkg to troubleshoot further 
+sudo dnf install policycoreutils-python-utils
+
+# run the command below to allow semodule to create the policy package file to enable haproxy work
+sudo ausearch -m avc -ts recent | audit2allow -M haproxy_fix
+sudo semodule -i haproxy_fix.pp
+
+# refresh the daemon and restart ha proxy
+sudo systemctl daemon-reload
+sudo systemctl start haproxy
+
+# check the logs, look out for the server that is up
+journalctl -u haproxy -n 100
+
+Started HAProxy Load Balancer.
+haproxy version is 2.4.22-f8e3218
+Server postgres_backend/psql11 is UP, reason: Layer7 check passed, code: 200, check duration: 58ms. 2 active and 0 backup servers online. 0 sessions r>
+Server postgres_backend/psql12 is DOWN, reason: Layer7 wrong status, code: 503, info: "Service Unavailable", check duration: 68ms. 1 active and 0 back>
+Server postgres_backend/psql11 is DOWN, reason: Layer7 wrong status, code: 503, info: "Service Unavailable", check duration: 58ms. 0 active and 0 back>
+
+# configuring keepalived 
+# keepalived helps with ensuring HA & zero downtime should anything happen to any of the HA proxy nodes
+
+# install keepalived -> this should be done on all 3 haproxy nodes
+sudo dnf install keepalived -y
+
+# create or append the below into the config file on all haprozy servers
+# on node 1:
+sudo vi /etc/keepalived/keepalived.conf
+
+# paste the below 
+global_defs {
+    enable_script_security
+    script_user keepalived_script
+}
+
+vrrp_script check_haproxy {
+    script "/etc/keepalived/check_haproxy.sh"
+    interval 2
+    fall 3
+    rise 2
+}
+
+vrrp_instance VI_1 {
+    state MASTER
+    interface enp0s1
+    virtual_router_id 51
+    priority 100
+    advert_int 1
+    authentication {
+        auth_type PASS
+        auth_pass rAGbo7ta
+    }
+    virtual_ipaddress {
+        192.168.64.203
+    }
+    track_script {
+        check_haproxy
+    }
+}
+
+# on node 2:
+sudo vi /etc/keepalived/keepalived.conf
+
+# paste the below 
+global_defs {
+    enable_script_security
+    script_user keepalived_script
+}
+
+vrrp_script check_haproxy {
+    script "/etc/keepalived/check_haproxy.sh"
+    interval 2
+    fall 3
+    rise 2
+}
+
+vrrp_instance VI_1 {
+    state BACKUP
+    interface enp0s1
+    virtual_router_id 51
+    priority 90
+    advert_int 1
+    authentication {
+        auth_type PASS
+        auth_pass rAGbo7ta
+    }
+    virtual_ipaddress {
+        192.168.64.203
+    }
+    track_script {
+        check_haproxy
+    }
+}
+
+
+# on node 3:
+sudo vi /etc/keepalived/keepalived.conf
+
+# paste the below 
+global_defs {
+    enable_script_security
+    script_user keepalived_script
+}
+
+vrrp_script check_haproxy {
+    script "/etc/keepalived/check_haproxy.sh"
+    interval 2
+    fall 3
+    rise 2
+}
+
+vrrp_instance VI_1 {
+    state BACKUP
+    interface enp0s1
+    virtual_router_id 51
+    priority 80
+    advert_int 1
+    authentication {
+        auth_type PASS
+        auth_pass rAGbo7ta
+    }
+    virtual_ipaddress {
+        192.168.60.203
+    }
+    track_script {
+        check_haproxy
+    }
+}
+
+# explaining a few things from the config files above
+#   - global_defs captures the global settings for the config & ensures adequate privileges are assigned to the keepalived user to execute the scripts & prevents any potential security vulnerabilities
+#   - vrrp_script tells keepalived the path to the script & the frequency of the execution, if it fails after 3 consective times failover
+#   - ideally the vrrp_instance is the conveyor of the VIP. it determines who is MASTER/BACKUP which is defined thru the priority level in each node
+
+# to retrieve device interface
+nmcli device status # replace this with the interface parameter
+
+# ideally keepalived should start if haproxy is running, but should there be errors. 
+# look at the logs, if it's authentication issues, readjust the auth_pass to be alphanumeric & 8 letters. anything outside 8 characters will be truncated and errors thrown
+
+# create the check_haproxy script to enable the VIP to reroute connection thru the 5566 port as stated in line #673
+sudo vi /etc/keepalived/check_haproxy.sh
+
+# paste the content below -> this should be done on all 3 haproxy nodes
+#!/bin/bash
+
+# -> Define the port to check (e.g., HAProxy frontend port)
+PORT=5566
+
+# -> Check if HAProxy is running
+if ! pidof haproxy > /dev/null; then
+    echo "HAProxy is not running"
+    exit 1
+fi
+
+# Check if HAProxy is listening on the expected port
+if ! ss -ltn | grep -q ":${PORT}"; then
+    echo "HAProxy is not listening on port ${PORT}"
+    exit 2
+fi
+
+# All checks passed
+exit 0
+
+# create the keepalived_script user as stated on line #796 and adjust permissions where necessary
+sudo useradd -r -s /bin/false keepalived_script
+sudo chmod +x /etc/keepalived/check_haproxy.sh
+sudo chown keepalived_script:keepalived_script /etc/keepalived/check_haproxy.sh
+sudo chmod 700 /etc/keepalived/check_haproxy.sh
+
+# check the logs for keepalived and follow 
+sudo journalctl -u keepalived -f
+
+# look out for the MASTER state
+systemd[1]: Started LVS and VRRP High Availability Monitor.
+Keepalived_vrrp[100093]: VRRP sockpool: [ifindex(  2), family(IPv4), proto(112), fd(12,13) multicast, address(224.0.0.18)]
+Keepalived_vrrp[100093]: VRRP_Script(check_haproxy) succeeded
+Keepalived_vrrp[100093]: (VI_1) Entering BACKUP STATE
+hap11 Keepalived_vrrp[100093]: (VI_1) Receive advertisement timeout
+hap11 Keepalived_vrrp[100093]: (VI_1) Entering MASTER STATE
+
+# ping the virtual IP on local machine to confirm reply
+ping 192.168.60.203
